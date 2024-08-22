@@ -1,0 +1,12 @@
+{
+    "Rotation degrees": [
+        0,
+        0,
+        225
+    ],
+    "Image rotation mode": "bspline",
+    "Label rotation mode": "nearest",
+    "MAE error on original images": 0.02035486348804537,
+    "DICE metric on labels": 0.9787377615769705,
+    "DICE metric on segmentations": 0.5640329321225485
+}

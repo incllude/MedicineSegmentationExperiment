@@ -1,0 +1,12 @@
+{
+    "Rotation degrees": [
+        0,
+        90,
+        0
+    ],
+    "Image rotation mode": "bilinear",
+    "Label rotation mode": "label_gaussian",
+    "MAE error on original images": 1.1005125466163453e-06,
+    "DICE metric on labels": 0.9216274619102478,
+    "DICE metric on segmentations": 0.31563735008239746
+}

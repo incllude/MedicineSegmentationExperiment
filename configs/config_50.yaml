@@ -1,0 +1,18 @@
+add_padding: true
+check_correctness: true
+device: cuda:1
+evaluate_rotation_effect: true
+generate_images: false
+image_rotation_mode: linear
+label_rotation_mode: nearest
+path_to_btcv: /media/ssd-3t-2/arkhipov/data/med/btcv/Abdomen/RawData/Training
+path_to_meta: split_meta.json
+path_to_model_checkpoint: UNETR_model_best_acc.pth
+path_to_output: data/0_90_0
+random_state: 43
+rotation_degrees:
+- 0
+- 90
+- 0
+run_name: remake
+use_wandb: false

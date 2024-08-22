@@ -1,0 +1,12 @@
+{
+    "Rotation degrees": [
+        135,
+        0,
+        0
+    ],
+    "Image rotation mode": "linear",
+    "Label rotation mode": "nearest",
+    "MAE error on original images": 0.018184092423820956,
+    "DICE metric on labels": 0.9763282835483551,
+    "DICE metric on segmentations": 0.40639736751715344
+}
