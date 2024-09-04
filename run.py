@@ -22,6 +22,7 @@ import numpy as np
 import torch
 import wandb
 import json
+import gc
 
 
 parser = ArgumentParser()
@@ -32,11 +33,10 @@ path_to_config = args.config
 print(f"{path_to_config.upper()} IS RUNNING")
 config = Config(path_to_config)
 config.init()
-config.rotation_degrees = np.array(config.rotation_degrees)
 config.path_to_output = Path(config.path_to_output)
 config.path_to_output.mkdir(exist_ok=True)
 config_log = {k: v for k, v in dict(vars(config)).items() if k[:2] != "__"}
-run_name = f"{config.image_rotation_mode}_{config.label_rotation_mode}"
+run_name = f"from_{config.angle_range[0]}_to_{config.angle_range[1]}"
 
 
 model = UNETR(
@@ -66,24 +66,20 @@ metadata = load_decathlon_datalist(
     base_dir=config.path_to_btcv
 )
 
+border = int(490 * (np.sin((20 + 45) * np.pi / 180) - np.sin(np.pi / 4)))
 dataset = CustomDataset(
     metadata=metadata,
-    image_rotation_mode=config.image_rotation_mode,
-    label_rotation_mode=config.label_rotation_mode,
-    rotation_degrees=config.rotation_degrees,
-    add_padding=config.add_padding
+    angle_range=config.angle_range,
+    n_rotations=config.n_rotations,
+    add_padding=config.add_padding,
+    border=border
 )
 
 result_json = {
-    "Rotation degrees": config.rotation_degrees.tolist(),
-    "Image rotation mode": config.image_rotation_mode,
-    "Label rotation mode": config.label_rotation_mode
+    "Rotation degrees range": config.angle_range,
+    "Num rotations": config.n_rotations
 }
 
-to_onehot = transforms.Compose([
-    transforms.EnsureType("tensor", device="cpu"),
-    transforms.AsDiscrete(to_onehot=14)
-])
 to_onehot_output = transforms.Compose([
         transforms.EnsureType("tensor", device="cpu"),
         transforms.AsDiscrete(argmax=True, to_onehot=14)
@@ -96,47 +92,85 @@ mae_metric, mae_values, dice_metrics, dice_output_metrics = MeanAbsoluteError(),
 dice_metric = DiceMetric(include_background=False, reduction="mean", get_not_nans=False)
 dice_output_metric = DiceMetric(include_background=False, reduction="mean", get_not_nans=False)
 
-for i in tqdm(range(len(dataset))):
 
-    sample, rotated_sample, transformed_sample = dataset.get_double_rotated_sample(i)
-    label, transformed_label = to_onehot(deepcopy(sample["label"])), to_onehot(transformed_sample["label"])
-    rotated_image = rotated_sample["image"].unsqueeze(0).to(config.device)
-    rotated_label = to_onehot(rotated_sample["label"])
+for i in range(len(dataset)):
+    with torch.no_grad():
 
-    mae_values.append(mae_metric(transformed_sample["image"], sample["image"]).item() * calc_scale_coef(sample["image"], transformed_sample["image"]))
-    dice_metric(y_pred=transformed_label, y=label)
-    dice_metrics.append(dice_metric.aggregate().item())
-    dice_metric.reset()
+        sample = dataset.get_sample(i)
+        preprocessed_sample = dataset.preprocessing(sample)
+        image = preprocessed_sample["image"]
+        label = preprocessed_sample["label"]
 
-    if config.evaluate_rotation_effect:
-        with torch.no_grad():
-            prediction = sliding_window_inference(rotated_image, config.img_size, 4, model, overlap=config.overlap)
-            prediction_ = to_onehot_output(deepcopy(prediction[0]))
-            dice_output_metric(y_pred=prediction_, y=rotated_label)
-            dice_output_metrics.append(dice_output_metric.aggregate().item())
-            dice_output_metric.reset()
+        for j in tqdm(range(dataset.n_rotations)):
 
-    if config.generate_images and i == 0:
-        if not config.evaluate_rotation_effect:
-            with torch.no_grad():
-                prediction = sliding_window_inference(rotated_image, config.img_size, 4, model, overlap=config.overlap)
-        p_r = to_discrete(prediction[0])
-        p_r = dataset.inv_label_rotation({"label": p_r})["label"]
-        x_r = transformed_sample["image"]
-        x = sample["image"].to(config.device)
-        with torch.no_grad():
-            p = to_discrete(
-                sliding_window_inference(x.unsqueeze(0), config.img_size, 4, model, overlap=config.overlap)[0]
-            )
-        x = x.cpu()
-        g = sample["label"]
+            rotated_sample = dataset.rotate_sample(sample, j)
+            transformed_sample = dataset.inverse_rotate_sample(rotated_sample, j)
+            preprocessed_rotated_sample = dataset.preprocessing(rotated_sample)
+            preprocessed_transformed_sample = dataset.preprocessing(transformed_sample)
+            rotated_image = preprocessed_rotated_sample["image"].unsqueeze(0).to(config.device)
+            rotated_label = preprocessed_rotated_sample["label"].unsqueeze(0)
+            transformed_image = preprocessed_transformed_sample["image"]
+            transformed_label = preprocessed_transformed_sample["label"]
+
+            mae_values.append(mae_metric(image, transformed_image).item() * calc_scale_coef(image, transformed_image))
+            dice_metric(y_pred=transformed_label, y=label)
+
+            if config.evaluate_rotation_effect:
+                predictions = sliding_window_inference(rotated_image, config.img_size, config.batch_size, model, overlap=config.overlap)
+                predictions_ = to_onehot_output(predictions[0]).unsqueeze(0)
+                dice_output_metric(y_pred=predictions_, y=rotated_label)
+                dice_output_metrics.append((i, j, dice_output_metric.aggregate().item()))
+                dice_output_metric.reset()
+
+                predictions = predictions.cpu()
+                predictions_ = predictions_.cpu()
+
+            rotated_image = rotated_image.cpu()
+
+        dice_metrics.append(dice_metric.aggregate().item())
+        dice_metric.reset()
+
+
+if config.generate_images:
+
+    dice_output_metrics = sorted(dice_output_metrics, key=lambda x: x[2])
+    i, j, median_score = dice_output_metrics[len(dice_output_metrics) // 2]
+
+    sample = dataset.get_sample(i)
+    rotated_sample = dataset.rotate_sample(sample, j)
+    transformed_sample = dataset.inverse_rotate_sample(rotated_sample, j)
+    preprocessed_sample = dataset.preprocessing(sample)
+    preprocessed_rotated_sample = dataset.preprocessing(rotated_sample)
+    preprocessed_transformed_sample = dataset.preprocessing(transformed_sample)
+    rotated_image = preprocessed_rotated_sample["image"].to(config.device)
+    transformed_image = preprocessed_transformed_sample["image"]
+    x = preprocessed_sample["image"].to(config.device)
+    g = to_discrete(preprocessed_sample["label"])
+
+    with torch.no_grad():
+        prediction = sliding_window_inference(rotated_image.unsqueeze(0), config.img_size, config.batch_size, model, overlap=config.overlap)
+    p_r = to_discrete(prediction[0])
+    p_r = dataset.inverse_hc_rotate_sample({"label": p_r}, j)["label"]
+    x_r = transformed_image
+    with torch.no_grad():
+        prediction = sliding_window_inference(x.unsqueeze(0), config.img_size, config.batch_size, model, overlap=config.overlap)
+    p = to_discrete(prediction[0])
+    x = x.cpu()
+
+
+dice_output_metrics = list(map(lambda x: (x[2]), dice_output_metrics))
 
 
 if config.check_correctness:
-    result_json["MAE error on original images"] = np.mean(mae_values)
-    result_json["DICE metric on labels"] = np.mean(dice_metrics)
+    result_json["MAPE error on original images"] = np.mean(mae_values)
+    result_json["Mean DICE metric on labels"] = np.mean(dice_metrics)
 if config.evaluate_rotation_effect:
-    result_json["DICE metric on segmentations"] = np.mean(dice_output_metrics)
+    result_json["Mean DICE metric on segmentations"] = np.mean(dice_output_metrics)
+if config.generate_images:
+    result_json["Sample index"] = i
+    result_json["Rotation index"] = j
+    result_json["Median DICE metric on segmentations"] = median_score
+
 
 if config.check_correctness or config.evaluate_rotation_effect:
     with open(config.path_to_output.joinpath(f"metrics_{run_name}.json"), "w") as f:
@@ -145,7 +179,7 @@ if config.check_correctness or config.evaluate_rotation_effect:
 if config.use_wandb:
     wandb.init(
         project="Diploma",
-        name=config.run_name + f"_{config.rotation_degrees}",
+        name=f"metrics_{run_name}",
         config=config_log
     )
     wandb.log(result_json)
@@ -159,11 +193,12 @@ if config.generate_images:
         p[0, i, 1, 0] = i
         g[0, i, 1, 0] = i
 
+    m = border // 2
     idxs = find_slices_with_largest_errors(p_r, p, g, axis=-1)
-    p_x_r = blend_images(x_r, p_r)[:, 100:-100, 100:-100, :]
-    p_x = blend_images(x, p)[:, 100:-100, 100:-100, :]
-    g_x = blend_images(x, g)[:, 100:-100, 100:-100, :]
-    p_r = p_r[:, 100:-100, 100:-100, :]
-    p = p[:, 100:-100, 100:-100, :]
+    p_x_r = blend_images(x_r, p_r)[:, m:-m, m:-m, :]
+    p_x = blend_images(x, p)[:, m:-m, m:-m, :]
+    g_x = blend_images(x, g)[:, m:-m, m:-m, :]
+    p_r = p_r[:, m:-m, m:-m, :]
+    p = p[:, m:-m, m:-m, :]
 
     visualize_slices(config.path_to_output, run_name, p_r, p, p_x_r, p_x, g_x, idxs, axis=-1)

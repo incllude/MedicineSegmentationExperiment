@@ -1,0 +1,13 @@
+{
+    "Rotation degrees range": [
+        0,
+        0
+    ],
+    "Num rotations": 1,
+    "MAPE error on original images": 8.421258322088813e-07,
+    "Mean DICE metric on labels": 1.0,
+    "Mean DICE metric on segmentations": 0.7740231454372406,
+    "Sample index": 2,
+    "Rotation index": 0,
+    "Median DICE metric on segmentations": 0.7756811380386353
+}

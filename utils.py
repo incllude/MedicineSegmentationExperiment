@@ -2,6 +2,7 @@ from monai.transforms import AsDiscrete, Compose, Transform
 from monai.visualize.utils import matshow3d, blend_images
 from monai.data import decollate_batch, NibabelWriter
 from monai.inferers import sliding_window_inference
+from scipy.spatial.transform import Rotation
 from dacite import Config as DaciteConfig
 from monai.utils import set_determinism
 import monai.transforms as transforms
@@ -601,7 +602,7 @@ class MedNeXtModule(l.LightningModule):
 
 class CustomDataset():
 
-    def __init__(self, metadata, image_rotation_mode, label_rotation_mode, rotation_degrees, add_padding):
+    def __init__(self, metadata, angle_range, n_rotations, add_padding, border):
 
         self.metadata = metadata
         self.base = transforms.Compose([
@@ -611,51 +612,71 @@ class CustomDataset():
             transforms.Spacingd(
                 keys=["image", "label"], pixdim=(1.5, 1.5, 2.0), mode=("bilinear", "nearest")
             ),
-            transforms.SpatialPadd(
-                keys=["image"], spatial_size=481, value=-175
+            # transforms.CropForegroundd(keys=["image", "label"], source_key="image"),
+            transforms.BorderPadd(
+                keys=["image"], spatial_border=border // 2, value=-175
             ) if add_padding else transforms.Identity(),
-            transforms.SpatialPadd(
-                keys=["label"], spatial_size=481, value=0
+            transforms.BorderPadd(
+                keys=["label"], spatial_border=border // 2, value=0
             ) if add_padding else transforms.Identity()
         ])
-        self.preprocessing = transforms.ScaleIntensityRanged(
-            keys="image", a_min=-175.0, a_max=250.0, b_min=0.0, b_max=1.0, clip=True
+        self.preprocessing = transforms.Compose([
+            transforms.ScaleIntensityRanged(
+                keys="image", a_min=-175.0, a_max=250.0, b_min=0.0, b_max=1.0, clip=True
+            ),
+            transforms.EnsureTyped(keys="label", data_type="tensor", device="cpu"),
+            transforms.AsDiscreted(keys="label", to_onehot=14)
+        ])
+
+        self.n_rotations = n_rotations
+        self.angle_range = angle_range
+        
+        # Generate n rotation vectors with norm equal to degrees from angle_range
+        directions = np.random.uniform(low=-1.0, high=1.0, size=(n_rotations, 3))
+        directions /= np.linalg.norm(directions, axis=-1)[:, np.newaxis]
+        angles = np.random.uniform(low=angle_range[0], high=angle_range[1], size=n_rotations)
+        self.rotation_vectors = angles[:, np.newaxis] * directions
+
+        # Generate rotation matrices from rotation vectors
+        self.rotation_matrices = Rotation.from_rotvec(self.rotation_vectors, degrees=True).as_matrix()
+        inverse_rotation_matrices = Rotation.from_rotvec(-self.rotation_vectors, degrees=True).as_matrix()
+        
+        # Add padding to rotation matrices
+        self.rotation_matrices = np.pad(
+            self.rotation_matrices,
+            ((0, 0), (0, 1), (0, 1)),
+            mode='constant',
+            constant_values=0
+        )
+        inverse_rotation_matrices = np.pad(
+            inverse_rotation_matrices,
+            ((0, 0), (0, 1), (0, 1)),
+            mode='constant',
+            constant_values=0
         )
 
-        rotation_angles = rotation_degrees * np.pi / 180
-        if image_rotation_mode in ["bilinear", "nearest"]:
-            self.image_rotation = transforms.Rotated(
-                keys="image",
-                angle=rotation_angles,
-                keep_size=True,
-                mode=image_rotation_mode
+        self.rotations = [
+            transforms.Affined(
+                keys=["image", "label"],
+                mode=["bilinear", "nearest"],
+                affine=self.rotation_matrices[i],
+                allow_missing_keys=True
             )
-            self.inv_image_rotation = self.image_rotation.inverse
-        if image_rotation_mode in ["linear", "blackman", "bspline", "cosine", "gaussian", "hamming", "lanczos", "welch"]:
-            self.image_rotation = tio.Affine(
-                scales=(1, 1, 1),
-                degrees=-rotation_degrees,
-                translation=(0, 0, 0),
-                image_interpolation=image_rotation_mode,
-                include=["image"]
+            for i in range(self.n_rotations)
+        ]
+        self.inv_rotations = [
+            transform.inverse
+            for transform in self.rotations
+        ]
+        self.inv_hc_rotations = [
+            transforms.Affined(
+                keys=["image", "label"],
+                mode=["bilinear", "nearest"],
+                affine=inverse_rotation_matrices[i],
+                allow_missing_keys=True
             )
-            self.inv_image_rotation = self.image_rotation.inverse()
-        if label_rotation_mode in ["nearest", "label_gaussian"]:
-            self.label_rotation = tio.Affine(
-                scales=(1, 1, 1),
-                degrees=-rotation_degrees,
-                translation=(0, 0, 0),
-                image_interpolation=label_rotation_mode,
-                include=["label"]
-            )
-            self.inv_label_rotation = self.label_rotation.inverse()
-        if label_rotation_mode == "detailed":
-            self.label_rotation = RotateSegmentationd(
-                keys="label", angle=rotation_angles, num_classes=14, inverse=False, mode="bilinear"
-            )
-            self.inv_label_rotation = RotateSegmentationd(
-                keys="label", angle=-rotation_angles, num_classes=14, inverse=True, mode="bilinear"
-            )
+            for i in range(self.n_rotations)
+        ]
 
     def __len__(self):
         return len(self.metadata)
@@ -663,7 +684,7 @@ class CustomDataset():
     def get_sample(self, index):
 
         item = self.metadata[index]
-        sample = self.preprocessing(self.base(deepcopy(item)))
+        sample = self.base(deepcopy(item))
 
         return sample
 
@@ -671,31 +692,62 @@ class CustomDataset():
 
         item = self.metadata[index]
         sample = self.base(deepcopy(item))
-        # sample = tio.Subject(
-        #     image=Image(tensor=sample["image"].numpy(), type=tio.INTENSITY),
-        #     label=Image(tensor=sample["label"].numpy(), type=tio.LABEL)
-        # )
-        rotated_sample = self.label_rotation(self.image_rotation(sample))
+        rotated_samples = {
+            "image": [],
+            "label": []
+        }
+        
+        for rotation in self.rotations:
+            rotated_sample = self.preprocessing(rotation(sample))
+            rotated_samples["image"].append(rotated_sample["image"])
+            rotated_samples["label"].append(rotated_sample["label"])
+        
         sample = self.preprocessing(sample)
-        rotated_sample = self.preprocessing(rotated_sample)
+        rotated_samples["image"] = torch.stack(rotated_samples["image"])
+        rotated_samples["label"] = torch.stack(rotated_samples["label"])
 
-        return sample, rotated_sample
+        return sample, rotated_samples
 
     def get_double_rotated_sample(self, index):
 
         item = self.metadata[index]
         sample = self.base(deepcopy(item))
-        # sample = tio.Subject(
-        #     image=Image(tensor=sample["image"].numpy(), type=tio.INTENSITY),
-        #     label=Image(tensor=sample["label"].numpy(), type=tio.LABEL)
-        # )
-        rotated_sample = self.label_rotation(self.image_rotation(sample))
-        double_rotated_sample = self.inv_label_rotation(self.inv_image_rotation(rotated_sample))
+        double_rotated_samples = {
+            "image": [],
+            "label": []
+        }
+        rotated_samples = deepcopy(double_rotated_samples)
+        
+        for rotation, inv_rotation in tqdm(zip(self.rotations, self.inv_rotations), total=self.n_rotations):
+            rotated_sample = rotation(sample)
+            double_rotated_sample = inv_rotation(rotated_sample)
+            processed_rotated = self.preprocessing(rotated_sample)
+            processed_double_rotated = self.preprocessing(double_rotated_sample)
+            rotated_samples["image"].append(processed_rotated["image"])
+            rotated_samples["label"].append(processed_rotated["label"])
+            double_rotated_samples["image"].append(processed_double_rotated["image"])
+            double_rotated_samples["label"].append(processed_double_rotated["label"])
+        
         sample = self.preprocessing(sample)
-        rotated_sample = self.preprocessing(rotated_sample)
-        double_rotated_sample = self.preprocessing(double_rotated_sample)
+        rotated_samples["image"] = torch.stack(rotated_samples["image"])
+        rotated_samples["label"] = torch.stack(rotated_samples["label"])
+        double_rotated_samples["image"] = torch.stack(double_rotated_samples["image"])
+        double_rotated_samples["label"] = torch.stack(double_rotated_samples["label"])
 
-        return sample, rotated_sample, double_rotated_sample
+        return sample, rotated_samples, double_rotated_samples
+
+
+    def rotate_sample(self, sample, i):
+
+        return self.rotations[i](sample)
+    
+    def inverse_rotate_sample(self, sample, i):
+
+        return self.inv_rotations[i](sample)
+    
+    def inverse_hc_rotate_sample(self, sample, i):
+
+        return self.inv_hc_rotations[i](sample)
         
 
 def harmonic_mean(value1, value2):
@@ -809,7 +861,6 @@ def get_rectangle(class_map1, class_map2):
 def rectangles_intersect(rect1, rect2):
     x1, y1, w1, h1 = rect1
     x2, y2, w2, h2 = rect2
-    print(rect1, rect2)
 
     return (x1 - 7 <= x2 <= x1 + w1 + 7 or x2 - 7 <= x1 <= x2 + w2 + 7) and (y1 - 7 <= y2 <= y1 + h1 + 7 or y2 - 7 <= y1 <= y2 + h2 + 7)
     # return (x1 <= x2 <= x1 + w1 or x2 <= x1 <= x2 + w2) and (y1 <= y2 <= y1 + h1 or y2 <= y1 <= y2 + h2)
@@ -853,9 +904,9 @@ def visualize_slices(path_to_output, run_name, seg1, seg2, bg_seg1, bg_seg2, gro
         slice2 = bg_seg2.select(axis, slice_idx)
         slice_gt = ground_truth.select(axis, slice_idx)
         rectangles = get_rectangle(seg1.select(axis, slice_idx), seg2.select(axis, slice_idx))
-
-        axs[i, 0].imshow(slice1.permute(1, 2, 0).cpu().numpy(), cmap='gray')
-        axs[i, 0].set_title(f'Сегментация на повернутом объеме - Срез {slice_idx}')
+        
+        axs[i, 0].imshow(slice_gt.permute(1, 2, 0).cpu().numpy(), cmap='gray')
+        axs[i, 0].set_title(f'Истинно верная карта классов - Срез {slice_idx}')
         axs[i, 0].set_xticks([])
         axs[i, 0].set_yticks([])
         
@@ -863,9 +914,9 @@ def visualize_slices(path_to_output, run_name, seg1, seg2, bg_seg1, bg_seg2, gro
         axs[i, 1].set_title(f'Сегментация на объеме - Срез {slice_idx}')
         axs[i, 1].set_xticks([])
         axs[i, 1].set_yticks([])
-        
-        axs[i, 2].imshow(slice_gt.permute(1, 2, 0).cpu().numpy(), cmap='gray')
-        axs[i, 2].set_title(f'Истинно верная карта классов - Срез {slice_idx}')
+
+        axs[i, 2].imshow(slice1.permute(1, 2, 0).cpu().numpy(), cmap='gray')
+        axs[i, 2].set_title(f'Сегментация на повернутом объеме - Срез {slice_idx}')
         axs[i, 2].set_xticks([])
         axs[i, 2].set_yticks([])
 
