@@ -614,16 +614,17 @@ class CustomDataset():
             ),
             # transforms.CropForegroundd(keys=["image", "label"], source_key="image"),
             transforms.BorderPadd(
-                keys=["image"], spatial_border=border // 2, value=-175
+                keys=["image"], spatial_border=border, value=-5000.
             ) if add_padding else transforms.Identity(),
             transforms.BorderPadd(
-                keys=["label"], spatial_border=border // 2, value=0
+                keys=["label"], spatial_border=border, value=0
             ) if add_padding else transforms.Identity()
         ])
         self.preprocessing = transforms.Compose([
             transforms.ScaleIntensityRanged(
                 keys="image", a_min=-175.0, a_max=250.0, b_min=0.0, b_max=1.0, clip=True
             ),
+            transforms.EnsureTyped(keys="image", data_type="tensor", device="cpu", dtype=torch.float),
             transforms.EnsureTyped(keys="label", data_type="tensor", device="cpu"),
             transforms.AsDiscreted(keys="label", to_onehot=14)
         ])
