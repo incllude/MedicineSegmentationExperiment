@@ -6,13 +6,13 @@
     "Num rotations": 101,
     "MAPE error on original images": 0.02556306979491349,
     "Mean DICE metric on labels": 0.9961248139540354,
-    "Mean DICE metric on segmentations": 0.7354525469317295,
-    "Mean IoU": 0.5978496182377976,
-    "Mean Jaccard index": 0.8969960975961717,
-    "Mean Precision": 0.7148835916723749,
-    "Mean Recall": 0.9070247640900879,
-    "Mean Miss rate": 0.0929752371393808,
+    "Mean DICE metric on segmentations": 0.7354588839087156,
+    "Mean IoU": 0.5978574524618218,
+    "Mean Jaccard index": 0.8969938307508777,
+    "Mean Precision": 0.7148857158009368,
+    "Mean Recall": 0.9070225315715613,
+    "Mean Miss rate": 0.09297746967020208,
     "Sample index": 2,
     "Rotation index": 71,
-    "Median DICE metric on segmentations": 0.7422182559967041
+    "Median DICE metric on segmentations": 0.7421862483024597
 }

@@ -2,6 +2,7 @@ from monai.transforms import AsDiscrete, Compose, Transform
 from monai.visualize.utils import matshow3d, blend_images
 from monai.data import decollate_batch, NibabelWriter
 from monai.inferers import sliding_window_inference
+from torchmetrics import Dice, Precision, Recall, JaccardIndex
 from scipy.spatial.transform import Rotation
 from dacite import Config as DaciteConfig
 from monai.utils import set_determinism
@@ -12,7 +13,6 @@ from torch.nn import functional as F
 from matplotlib.patches import Patch
 from monai.losses import DiceLoss
 import matplotlib.pyplot as plt
-from torchmetrics import Dice
 from dacite import from_dict
 import torch.optim as optim
 from copy import deepcopy
@@ -609,10 +609,9 @@ class CustomDataset():
             transforms.LoadImaged(keys=["image", "label"]),
             transforms.EnsureChannelFirstd(keys=["image", "label"]),
             transforms.Orientationd(keys=["image", "label"], axcodes="RAS"),
-            transforms.Spacingd(
-                keys=["image", "label"], pixdim=(1.5, 1.5, 2.0), mode=("bilinear", "nearest")
-            ),
-            # transforms.CropForegroundd(keys=["image", "label"], source_key="image"),
+            transforms.Spacingd(keys=["image", "label"],
+                                pixdim=(1.5, 1.5, 2.0),
+                                mode=("bilinear", "nearest")),
             transforms.BorderPadd(
                 keys=["image"], spatial_border=border, value=-5000.
             ) if add_padding else transforms.Identity(),
@@ -621,9 +620,12 @@ class CustomDataset():
             ) if add_padding else transforms.Identity()
         ])
         self.preprocessing = transforms.Compose([
-            transforms.ScaleIntensityRanged(
-                keys="image", a_min=-175.0, a_max=250.0, b_min=0.0, b_max=1.0, clip=True
-            ),
+            transforms.ScaleIntensityRanged(keys="image",
+                                            a_min=-175.0,
+                                            a_max=250.0,
+                                            b_min=0.0,
+                                            b_max=1.0,
+                                            clip=True),
             transforms.EnsureTyped(keys="image", data_type="tensor", device="cpu", dtype=torch.float),
             transforms.EnsureTyped(keys="label", data_type="tensor", device="cpu"),
             transforms.AsDiscreted(keys="label", to_onehot=14)
@@ -635,8 +637,8 @@ class CustomDataset():
         # Generate n rotation vectors with norm equal to degrees from angle_range
         directions = np.random.uniform(low=-1.0, high=1.0, size=(n_rotations, 3))
         directions /= np.linalg.norm(directions, axis=-1)[:, np.newaxis]
-        angles = np.random.uniform(low=angle_range[0], high=angle_range[1], size=n_rotations)
-        self.rotation_vectors = angles[:, np.newaxis] * directions
+        self.angles = np.random.uniform(low=angle_range[0], high=angle_range[1], size=n_rotations)
+        self.rotation_vectors = self.angles[:, np.newaxis] * directions
 
         # Generate rotation matrices from rotation vectors
         self.rotation_matrices = Rotation.from_rotvec(self.rotation_vectors, degrees=True).as_matrix()
@@ -757,25 +759,35 @@ def harmonic_mean(value1, value2):
 
 def find_slices_with_largest_errors(seg1, seg2, ground_truth, axis=2):
 
-    dice = Dice(num_classes=14, average="macro")
+    dice = Dice(num_classes=14, average="macro", ignore_index=0)
+    precision = Precision(num_classes=14, average="macro", ignore_index=0, task="multiclass")
+    recall = Recall(num_classes=14, average="macro", ignore_index=0, task="multiclass")
+    iou = JaccardIndex(num_classes=14, average="micro", ignore_index=0, task="multiclass")
     num_slices = seg1.size(axis)
     error_scores = []
     
-    for i in range(int(0.2 * num_slices), int(0.8 * num_slices) + 1, 10):
+    for i in range(0, num_slices):
 
         slice1 = seg1.select(axis, i)
         slice2 = seg2.select(axis, i)
         slice_gt = ground_truth.select(axis, i)
         
-        dice1 = dice(slice1, slice2)
-        dice2 = dice(slice2, slice_gt)
+        # dice1 = dice(slice1, slice2)
+        # error_score = min(recall(slice1, slice2), precision(slice1, slice2))
+        error_score = precision(slice1, slice2)
+        dice_score = dice(slice2, slice_gt)
         
-        error_score = dice1
-        if 0.5 < dice2:
+        # error_score = dice1
+        # print(i, dice1, dice2)
+        if dice_score > 0.3:
             error_scores.append((i, error_score))
     
-    error_scores.sort(key=lambda x: x[1])
-    worst_slices = [index for index, _ in error_scores[:4]]
+    worst_slices = []
+    error_scores.sort(key=lambda x: x[-1])
+    for i in range(4):
+        worst_slices.append(error_scores[0][0])
+        idx = worst_slices[-1]
+        error_scores = list(filter(lambda x: np.abs(x[0] - idx) > 9, error_scores))
     
     return worst_slices
 
@@ -791,8 +803,10 @@ def find_two_largest_connected_components(binary_map):
 
     sizes[0] = 0
     largest_labels = np.argsort(sizes)[-2:]
-    # if sizes[largest_labels[0]] < 100:
-        # largest_labels = largest_labels[[1]]
+    if sizes[largest_labels[1]] < 20:
+        return None
+    if sizes[largest_labels[0]] < 20:
+        largest_labels = largest_labels[[1]]
 
     boxes = []
     for label in largest_labels:
@@ -842,6 +856,8 @@ def get_rectangle(class_map1, class_map2):
 
     bin_mask = compute_difference_map(class_map1, class_map2)
     boxes = find_two_largest_connected_components(bin_mask)
+    if boxes is None:
+        return None
     boxes = merge_rectangles(boxes)
     rectangles = [
         patches.Rectangle(
@@ -864,8 +880,6 @@ def rectangles_intersect(rect1, rect2):
     x2, y2, w2, h2 = rect2
 
     return (x1 - 7 <= x2 <= x1 + w1 + 7 or x2 - 7 <= x1 <= x2 + w2 + 7) and (y1 - 7 <= y2 <= y1 + h1 + 7 or y2 - 7 <= y1 <= y2 + h2 + 7)
-    # return (x1 <= x2 <= x1 + w1 or x2 <= x1 <= x2 + w2) and (y1 <= y2 <= y1 + h1 or y2 <= y1 <= y2 + h2)
-    # return False
 
 
 def visualize_slices(path_to_output, run_name, seg1, seg2, bg_seg1, bg_seg2, ground_truth, slice_indices, axis=2):
@@ -892,19 +906,30 @@ def visualize_slices(path_to_output, run_name, seg1, seg2, bg_seg1, bg_seg2, gro
         "левая надпочечная железа"
     ]
     legend_patches = [Patch(color=colors[i], label=classes[i], alpha=0.5) for i in range(n_classes)]
+
+    non_empty_rectangles = []
     non_empty_indices = []
-    for slice_idx in slice_indices:
-        if ground_truth.select(axis, slice_idx).sum() > np.arange(13).sum():
-            non_empty_indices.append(slice_idx)
-    n = len(non_empty_indices)
-    fig, axs = plt.subplots(n, 3, figsize=(16, 5 * n))
-    
-    for i, slice_idx in enumerate(non_empty_indices):
+    for i, slice_idx in enumerate(slice_indices):
 
         slice1 = bg_seg1.select(axis, slice_idx)
         slice2 = bg_seg2.select(axis, slice_idx)
         slice_gt = ground_truth.select(axis, slice_idx)
         rectangles = get_rectangle(seg1.select(axis, slice_idx), seg2.select(axis, slice_idx))
+
+        if rectangles is not None:
+            non_empty_rectangles.append(rectangles)
+            non_empty_indices.append(slice_idx)
+
+    n = len(non_empty_indices)
+    fig, axs = plt.subplots(n, 3, figsize=(16, 5 * n))
+    if n == 1:
+        axs = axs[np.newaxis, :]
+    
+    for i, (slice_idx, rectangles) in enumerate(zip(non_empty_indices, non_empty_rectangles)):
+
+        slice1 = bg_seg1.select(axis, slice_idx)
+        slice2 = bg_seg2.select(axis, slice_idx)
+        slice_gt = ground_truth.select(axis, slice_idx)
         
         axs[i, 0].imshow(slice_gt.permute(1, 2, 0).cpu().numpy(), cmap='gray')
         axs[i, 0].set_title(f'Истинно верная карта классов - Срез {slice_idx}')
