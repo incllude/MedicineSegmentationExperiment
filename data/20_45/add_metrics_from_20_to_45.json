@@ -1,0 +1,18 @@
+{
+    "Rotation degrees range": [
+        20,
+        45
+    ],
+    "Num rotations": 201,
+    "MAPE error on original images": 0.030947610988828575,
+    "Mean DICE metric on labels": 0.9733710785706838,
+    "Mean DICE metric on segmentations": 0.613793734813211,
+    "Mean IoU": 0.47564270264572567,
+    "Mean Jaccard index": 0.8154943689679229,
+    "Mean Precision": 0.6581743524887076,
+    "Mean Recall": 0.8343246973569121,
+    "Mean Miss rate": 0.1656753031929235,
+    "Sample index": 4,
+    "Rotation index": 151,
+    "Median DICE metric on segmentations": 0.7421862483024597
+}
